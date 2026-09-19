@@ -158,14 +158,18 @@ index b009699524ad984cdd2c8379923ead06ab839e42..da512e34cfa74a351b02993668ac18af
    // trivially exhausted (sockets, SQLite, attachments, logs). Captured
 diff --git a/lib/utils/portable_mode.dart b/lib/utils/portable_mode.dart
 new file mode 100644
-index 0000000000000000000000000000000000000000..ec9322ad3655e90a6109326826b3a1042feb64d4
+index 0000000000000000000000000000000000000000..44bdf9e129256a49441092ef858ecbbdada49229
 --- /dev/null
 +++ b/lib/utils/portable_mode.dart
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,108 @@
 +import 'dart:io';
 +
 +import 'package:path/path.dart' as p;
 +import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
++import 'package:path_provider_windows/path_provider_windows.dart';
++import 'package:shared_preferences_platform_interface/shared_preferences_async_platform_interface.dart';
++import 'package:shared_preferences_platform_interface/shared_preferences_platform_interface.dart';
++import 'package:shared_preferences_windows/shared_preferences_windows.dart';
 +
 +const portableModeMarkerFileName = 'portable.mode';
 +const portableDataDirectoryName = 'userdata';
@@ -199,9 +203,24 @@ index 0000000000000000000000000000000000000000..ec9322ad3655e90a6109326826b3a104
 +    Directory(p.join(dataDirectory.path, child)).createSync(recursive: true);
 +  }
 +
-+  PathProviderPlatform.instance = PortablePathProviderPlatform(
++  final portablePathProvider = PortablePathProviderPlatform(
 +    dataRoot: dataDirectory.path,
 +  );
++  PathProviderPlatform.instance = portablePathProvider;
++
++  // shared_preferences_windows 2.4.1 bypasses PathProviderPlatform.instance
++  // and constructs PathProviderWindows directly. Point both of its registered
++  // stores at the same adapter so window geometry, UI hints, and other simple
++  // preferences stay under userdata too.
++  final preferencesStore = SharedPreferencesStorePlatform.instance;
++  if (preferencesStore is SharedPreferencesWindows) {
++    preferencesStore.pathProvider = portablePathProvider;
++  }
++  final asyncPreferencesStore = SharedPreferencesAsyncPlatform.instance;
++  if (asyncPreferencesStore is SharedPreferencesAsyncWindows) {
++    asyncPreferencesStore.pathProvider = portablePathProvider;
++  }
++
 +  _portableDataDirectory = dataDirectory;
 +  _portableModeActive = true;
 +}
@@ -212,7 +231,7 @@ index 0000000000000000000000000000000000000000..ec9322ad3655e90a6109326826b3a104
 +/// provider stay beside the application rather than leaking into the Windows
 +/// profile. Platform-only external-storage calls are redirected for the same
 +/// reason even though the Windows build does not normally use them.
-+class PortablePathProviderPlatform extends PathProviderPlatform {
++class PortablePathProviderPlatform extends PathProviderWindows {
 +  PortablePathProviderPlatform({required String dataRoot})
 +    : _dataRoot = p.normalize(dataRoot);
 +
@@ -252,7 +271,7 @@ index 0000000000000000000000000000000000000000..ec9322ad3655e90a6109326826b3a104
 +  }) async => [_dataRoot];
 +}
 diff --git a/pubspec.lock b/pubspec.lock
-index 60186e44b9c9a293fc3ea2cf58495c28ca07cc15..6603ab506d5517bd35bf3282f34b7f9576758236 100644
+index 60186e44b9c9a293fc3ea2cf58495c28ca07cc15..2fede38a85ec1bb726bf619fd397ea81fced5071 100644
 --- a/pubspec.lock
 +++ b/pubspec.lock
 @@ -2139,7 +2139,7 @@ packages:
@@ -264,19 +283,59 @@ index 60186e44b9c9a293fc3ea2cf58495c28ca07cc15..6603ab506d5517bd35bf3282f34b7f95
      description:
        name: path_provider_platform_interface
        sha256: "484838772624c3a4b94f1e44a3e19897fee738f2d5c4ce448443b0417f7c9dda"
+@@ -2147,7 +2147,7 @@ packages:
+     source: hosted
+     version: "2.1.3"
+   path_provider_windows:
+-    dependency: transitive
++    dependency: "direct main"
+     description:
+       name: path_provider_windows
+       sha256: bd6f00dbd873bfb70d0761682da2b3a2c2fccc2b9e84c495821639601d81afe7
+@@ -2692,7 +2692,7 @@ packages:
+     source: hosted
+     version: "2.4.1"
+   shared_preferences_platform_interface:
+-    dependency: transitive
++    dependency: "direct main"
+     description:
+       name: shared_preferences_platform_interface
+       sha256: "649dc798a33931919ea356c4305c2d1f81619ea6e92244070b520187b5140ef9"
+@@ -2708,7 +2708,7 @@ packages:
+     source: hosted
+     version: "2.4.3"
+   shared_preferences_windows:
+-    dependency: transitive
++    dependency: "direct main"
+     description:
+       name: shared_preferences_windows
+       sha256: "94ef0f72b2d71bc3e700e025db3710911bd51a71cefb65cc609dd0d9a982e3c1"
 diff --git a/pubspec.yaml b/pubspec.yaml
-index 94be0216db5997de511666fae2027f4223eebb11..2b9b119eda817011fcf4f7e035d694d3e64d45fe 100644
+index 94be0216db5997de511666fae2027f4223eebb11..6ed9739f11938c32a8025417ac663bebf5824807 100644
 --- a/pubspec.yaml
 +++ b/pubspec.yaml
-@@ -109,6 +109,7 @@ dependencies:
+@@ -109,6 +109,11 @@ dependencies:
    package_info_plus: ^9.0.0
    path: ^1.8.1
    path_provider: ^2.0.12
 +  path_provider_platform_interface: any
++  # Exact locked Windows implementation versions used by portable-mode
++  # adapters. These are promoted from transitive to direct dependencies
++  # without changing the resolved versions in pubspec.lock.
++  path_provider_windows: 2.3.0
    # permission_handler 13.x hard-codes Android compileSdk 37 in its plugin
    # module; android/build.gradle pins 36 (targetSdk follows it).
    permission_handler: ^12.0.0+1
-@@ -221,7 +222,6 @@ dev_dependencies:
+@@ -124,6 +129,8 @@ dependencies:
+   rxdart: ^0.28.0
+   share_plus: ^12.0.0
+   shared_preferences: ^2.3.2
++  shared_preferences_platform_interface: 2.4.2
++  shared_preferences_windows: 2.4.1
+   sherpa_onnx: 1.13.4
+   sliver_tools: ^0.2.12
+   sqflite_common_ffi: ^2.3.3
+@@ -221,7 +228,6 @@ dev_dependencies:
    mocktail: ^1.0.0
    msix: ^3.7.0
    objectbox_generator: ^5.2.0
@@ -309,13 +368,14 @@ index ab4c58cfdbc69fded5684069ff0ebb0cdc83f5d8..90ed796a9b2b2c0ec863828ae37571c9
          profile: profileOfType(ProfileType.real),
 diff --git a/test/utils/portable_mode_test.dart b/test/utils/portable_mode_test.dart
 new file mode 100644
-index 0000000000000000000000000000000000000000..e02fcd99d243b77c5f30bfd6e9f4b11f78c6494a
+index 0000000000000000000000000000000000000000..65f9342afc940f10537919603bf367d3c1306179
 --- /dev/null
 +++ b/test/utils/portable_mode_test.dart
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,37 @@
 +import 'package:flutter_test/flutter_test.dart';
 +import 'package:lotti/utils/portable_mode.dart';
 +import 'package:path/path.dart' as p;
++import 'package:path_provider_windows/path_provider_windows.dart';
 +
 +void main() {
 +  test(
@@ -325,6 +385,7 @@ index 0000000000000000000000000000000000000000..e02fcd99d243b77c5f30bfd6e9f4b11f
 +        dataRoot: r'D:\Lotti\userdata',
 +      );
 +
++      expect(provider, isA<PathProviderWindows>());
 +      final paths = <String?>[
 +        await provider.getApplicationSupportPath(),
 +        await provider.getApplicationDocumentsPath(),

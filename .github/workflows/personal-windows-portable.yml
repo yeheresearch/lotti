@@ -12,7 +12,7 @@ env:
   FLUTTER_VERSION: 3.47.2
   PORTABLE_PATCH: .github/portable-patches/0001-feat-add-marker-based-Windows-portable-mode.patch
   # SHA-256 of the canonical LF patch stored in Git.
-  PORTABLE_PATCH_SHA256: c91f8fe253b4e14167230b3fd45c6a0ac0a693058bf03ccef5ace086a01ec2ae
+  PORTABLE_PATCH_SHA256: 49448108fdac83c4834935fdf9a31bac680a5d4f2c4d9c0ea93e4a73768f5594
   PACKAGE_NAME: Lotti-Windows-x64-1.1.12+4390-true-portable-local-only
 
 jobs:
@@ -491,8 +491,15 @@ jobs:
           if (Test-Path "$dataRoot\matrix") {
             throw 'Matrix state directory was created even though device sync is disabled.'
           }
-          if (Test-Path $roamingRoot) { throw "App wrote outside package: $roamingRoot" }
-          if (Test-Path $localRoot) { throw "App wrote outside package: $localRoot" }
+          foreach ($legacyRoot in @($roamingRoot, $localRoot)) {
+            if (Test-Path -LiteralPath $legacyRoot) {
+              $label = if ($legacyRoot -eq $roamingRoot) { 'roaming' } else { 'local' }
+              Get-ChildItem -LiteralPath $legacyRoot -Force -Recurse |
+                Select-Object FullName,PSIsContainer,Length,LastWriteTimeUtc |
+                Export-Csv "$env:GITHUB_WORKSPACE\logs\unexpected-$label-storage.csv" -NoTypeInformation
+              throw "App wrote outside package: $legacyRoot"
+            }
+          }
 
           $null = $process.CloseMainWindow()
           if (-not $process.WaitForExit(15000)) {
@@ -556,9 +563,14 @@ jobs:
             Export-Csv "$env:GITHUB_WORKSPACE\logs\portable-userdata-after-restart.csv" -NoTypeInformation
 
       - name: Create ZIP and checksum
+        if: always()
         shell: pwsh
         run: |
           $packageDir = Get-ChildItem "$env:GITHUB_WORKSPACE\portable" -Directory | Select-Object -First 1
+          if (-not $packageDir) {
+            Write-Warning 'Portable directory was not assembled; no ZIP can be preserved.'
+            exit 0
+          }
           $zipPath = "$($packageDir.FullName).zip"
           Compress-Archive -Path $packageDir.FullName -DestinationPath $zipPath -CompressionLevel Optimal
           $zipHash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -570,13 +582,14 @@ jobs:
             Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\version-source.txt"
 
       - name: Upload portable ZIP
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PACKAGE_NAME }}
           path: |
             portable/${{ env.PACKAGE_NAME }}.zip
             portable/${{ env.PACKAGE_NAME }}.zip.sha256
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
           compression-level: 0
 
