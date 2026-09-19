@@ -442,8 +442,14 @@ jobs:
           $dataRoot = Join-Path $packageDir.FullName 'userdata'
           $roamingRoot = Join-Path $env:APPDATA 'com.matthiasnehlsen\Lotti'
           $localRoot = Join-Path $env:LOCALAPPDATA 'com.matthiasnehlsen\Lotti'
-          if (Test-Path $roamingRoot) { throw "Unexpected pre-existing test path: $roamingRoot" }
-          if (Test-Path $localRoot) { throw "Unexpected pre-existing test path: $localRoot" }
+          # Earlier build/test processes can initialize the upstream default
+          # location on the disposable runner. Remove only these exact app
+          # directories so the launch assertions below start from a known state.
+          foreach ($legacyRoot in @($roamingRoot, $localRoot)) {
+            if (Test-Path -LiteralPath $legacyRoot) {
+              Remove-Item -LiteralPath $legacyRoot -Recurse -Force
+            }
+          }
 
           cmdkey.exe /list | Set-Content "$env:GITHUB_WORKSPACE\logs\credentials-before.txt" -Encoding utf8
 
