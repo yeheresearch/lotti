@@ -12,7 +12,7 @@ env:
   FLUTTER_VERSION: 3.47.2
   PORTABLE_PATCH: .github/portable-patches/0001-feat-add-marker-based-Windows-portable-mode.patch
   # SHA-256 of the canonical LF patch stored in Git.
-  PORTABLE_PATCH_SHA256: 41b0dc768d096e429fa751c64aaffbc7cc4b583b4bcba191806d420524b64026
+  PORTABLE_PATCH_SHA256: 99d3a265aacd8e1d80940c6199fd28875aec23e60ce9d300f2cf4a1516cfbd56
   PACKAGE_NAME: Lotti-Windows-x64-1.1.12+4390-true-portable-local-only
 
 jobs:
@@ -93,10 +93,13 @@ jobs:
             'lib/features/settings_v2/domain/settings_tree_data.dart'
             'lib/features/sync/secure_storage.dart'
             'lib/main.dart'
+            'lib/services/window_service.dart'
+            'lib/utils/immediate_exit.dart'
             'lib/utils/portable_mode.dart'
             'pubspec.lock'
             'pubspec.yaml'
             'test/features/profiles/model/profile_context_test.dart'
+            'test/services/window_service_test.dart'
             'test/utils/portable_mode_test.dart'
             'windows/runner/win32_window.cpp'
           ) | Sort-Object
@@ -176,9 +179,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           flutter analyze --no-pub `
             lib/utils/portable_mode.dart `
+            lib/utils/immediate_exit.dart `
+            lib/services/window_service.dart `
             lib/features/profiles/model/profile_context.dart `
             lib/features/sync/secure_storage.dart `
             test/utils/portable_mode_test.dart `
+            test/services/window_service_test.dart `
             test/features/profiles/model/profile_context_test.dart 2>&1 |
             Tee-Object "$env:GITHUB_WORKSPACE\logs\portable-analyze.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -199,6 +205,7 @@ jobs:
         run: |
           $tests = @(
             'test/utils/portable_mode_test.dart',
+            'test/services/window_service_test.dart',
             'test/features/profiles/model/profile_context_test.dart',
             'test/features/settings_v2/ui/settings_tree_builder_test.dart',
             'integration_test/home_integration_test.dart',
@@ -397,6 +404,9 @@ jobs:
           * Disabled device-health import in portable mode because its Windows
             device-information probe has a Registry-backed implementation.
           * Removed the runner's direct Registry read for the Windows theme.
+          * After normal service/database shutdown, portable Windows exits via
+            the Win32 process API to avoid Flutter's reproducible native close
+            callback race (0xC000041D). Non-portable platforms are unchanged.
           * Runtime verification rejects application-controlled Registry
             content writes. Windows BAM execution accounting is reported
             separately because it is written by the operating system.
@@ -439,7 +449,7 @@ jobs:
               Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\native-dependencies.txt"
           }
 
-      - name: Launch, restart, storage and Registry-content-write smoke test
+      - name: Launch, clean-exit, restart, storage and Registry-content-write smoke test
         shell: pwsh
         run: |
           $sourcePackageDir = Get-ChildItem "$env:GITHUB_WORKSPACE\portable" -Directory | Select-Object -First 1
@@ -515,6 +525,9 @@ jobs:
             throw 'First launch did not close cleanly within 15 seconds.'
           }
           "first_exit_code=$($process.ExitCode)" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\launch-smoke.txt"
+          if ($process.ExitCode -ne 0) {
+            throw "First launch returned non-zero exit code $($process.ExitCode)"
+          }
 
           $databaseLength = (Get-Item "$dataRoot\db.sqlite").Length
           $restart = Start-Process -FilePath $exe -WorkingDirectory $packageDir.FullName -PassThru
@@ -535,6 +548,9 @@ jobs:
             throw 'Restart did not close cleanly within 15 seconds.'
           }
           "restart_exit_code=$($restart.ExitCode)" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\launch-smoke.txt"
+          if ($restart.ExitCode -ne 0) {
+            throw "Restart returned non-zero exit code $($restart.ExitCode)"
+          }
 
           Start-Process -FilePath $procmon -ArgumentList '/Terminate' -Wait
           Start-Process -FilePath $procmon -ArgumentList @(

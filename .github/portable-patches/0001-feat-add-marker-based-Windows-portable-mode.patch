@@ -156,6 +156,115 @@ index b009699524ad984cdd2c8379923ead06ab839e42..da512e34cfa74a351b02993668ac18af
    // Raise the file descriptor soft limit before anything opens an FD. On
    // macOS, GUI apps inherit launchd's legacy soft limit of 256, which is
    // trivially exhausted (sockets, SQLite, attachments, logs). Captured
+diff --git a/lib/services/window_service.dart b/lib/services/window_service.dart
+index cd91cf1b6170fe11f1c1e68ad2ba1f8d96644212..99ca0fce9dd3f4124e8f0b6aa95497c236a55d01 100644
+--- a/lib/services/window_service.dart
++++ b/lib/services/window_service.dart
+@@ -10,6 +10,7 @@ import 'package:lotti/services/logging_service.dart';
+ import 'package:lotti/services/service_disposer.dart';
+ import 'package:lotti/utils/immediate_exit.dart';
+ import 'package:lotti/utils/platform.dart';
++import 'package:lotti/utils/portable_mode.dart';
+ import 'package:window_manager/window_manager.dart';
+ 
+ /// Function signature for process exit.
+@@ -26,6 +27,7 @@ class WindowService with WidgetsBindingObserver implements WindowListener {
+     @visibleForTesting ExitCallback? exitOverride,
+     @visibleForTesting AsyncDisposer? playerDisposerOverride,
+     @visibleForTesting PlatformCheck? isMacOSOverride,
++    @visibleForTesting PlatformCheck? isPortableWindowsOverride,
+     AsyncDisposer? beforeLogFlush,
+     @visibleForTesting bool skipWindowManagerSetup = false,
+     @visibleForTesting AppPrefs? prefsOverride,
+@@ -34,6 +36,9 @@ class WindowService with WidgetsBindingObserver implements WindowListener {
+            playerDisposerOverride ?? AudioPlayerController.disposeActivePlayer,
+        _beforeLogFlush = beforeLogFlush ?? (() async {}),
+        _isMacOS = isMacOSOverride ?? (() => isMacOS),
++       _isPortableWindows =
++           isPortableWindowsOverride ??
++           (() => isWindows && isPortableModeActive),
+        _prefs = prefsOverride ?? makeSharedPrefsService() {
+     if (!skipWindowManagerSetup) {
+       windowManager.addListener(this);
+@@ -54,6 +59,7 @@ class WindowService with WidgetsBindingObserver implements WindowListener {
+   final AsyncDisposer _playerDisposer;
+   final AsyncDisposer _beforeLogFlush;
+   final PlatformCheck _isMacOS;
++  final PlatformCheck _isPortableWindows;
+   final AppPrefs _prefs;
+ 
+   final sizeKey = 'WINDOW_SIZE';
+@@ -230,9 +236,11 @@ class WindowService with WidgetsBindingObserver implements WindowListener {
+ 
+   Future<void> _closeWindow() async {
+     await shutdown();
+-    if (_isMacOS()) {
++    if (_isMacOS() || _isPortableWindows()) {
+       // All SQLite handles have been released while Dart FFI callbacks are
+       // still valid. Avoid a second native-finalizer pass during VM teardown.
++      // On portable Windows this also avoids a reproducible native window
++      // destruction callback race that exits with status 0xC000041D.
+       _exitFn(0);
+     } else {
+       try {
+diff --git a/lib/utils/immediate_exit.dart b/lib/utils/immediate_exit.dart
+index 3e0356e7b48793509bc47a252b110f1bb411f93d..5fff1743d34f7c203bb1f131dde5f2f1d71f76da 100644
+--- a/lib/utils/immediate_exit.dart
++++ b/lib/utils/immediate_exit.dart
+@@ -1,8 +1,10 @@
+ import 'dart:ffi';
++import 'dart:io';
+ 
+-/// Calls POSIX `_exit()` to terminate the process immediately.
++/// Terminates the process immediately without native/runtime teardown.
+ ///
+-/// Unlike Dart's `exit()` (which calls C `exit()`), POSIX `_exit()` does NOT:
++/// Unlike Dart's `exit()` (which calls C `exit()`), POSIX `_exit()` and
++/// Windows `TerminateProcess()` do NOT:
+ /// - Run atexit handlers
+ /// - Flush stdio buffers
+ /// - Run C++ static destructors
+@@ -17,9 +19,39 @@ import 'dart:ffi';
+ /// Safety: all Dart-level services must be disposed before calling this.
+ /// SQLite WAL mode guarantees data integrity on abrupt exit.
+ void immediateExit(int code) {
+-  _posixExit(code);
++  if (Platform.isWindows) {
++    _windowsExit(code);
++  } else {
++    _posixExit(code);
++  }
+ }
+ 
++/// Ends the Windows process without running Dart/native finalizers.
++///
++/// The portable Windows build calls this only after every service and SQLite
++/// database has completed its normal asynchronous shutdown. This avoids a
++/// reproducible Flutter window-destruction callback race (0xC000041D) during
++/// engine teardown.
++void _windowsExit(int code) {
++  final process = _getCurrentProcess();
++  final result = _terminateProcess(process, code);
++  if (result == 0) {
++    throw StateError('TerminateProcess failed');
++  }
++}
++
++final DynamicLibrary _kernel32 = Platform.isWindows
++    ? DynamicLibrary.open('kernel32.dll')
++    : DynamicLibrary.process();
++
++final int Function() _getCurrentProcess = _kernel32
++    .lookupFunction<IntPtr Function(), int Function()>('GetCurrentProcess');
++
++final int Function(int, int) _terminateProcess = _kernel32
++    .lookupFunction<Int32 Function(IntPtr, Uint32), int Function(int, int)>(
++      'TerminateProcess',
++    );
++
+ /// The resolved POSIX `_exit` function, lazily initialized.
+ final void Function(int) _posixExit = _lookupPosixExit();
+ 
 diff --git a/lib/utils/portable_mode.dart b/lib/utils/portable_mode.dart
 new file mode 100644
 index 0000000000000000000000000000000000000000..6d335a75a325033a7b33f53bebf3d3d3fd5c4e74
@@ -371,6 +480,46 @@ index ab4c58cfdbc69fded5684069ff0ebb0cdc83f5d8..90ed796a9b2b2c0ec863828ae37571c9
      test('real profiles get full capabilities', () {
        final context = ProfileContext.forProfile(
          profile: profileOfType(ProfileType.real),
+diff --git a/test/services/window_service_test.dart b/test/services/window_service_test.dart
+index 8fdfbad392899e415e7a91fc93cc9cffb07e6c8b..2358a491d77d5990fdc4af52b9f980eb01417b86 100644
+--- a/test/services/window_service_test.dart
++++ b/test/services/window_service_test.dart
+@@ -110,6 +110,35 @@ void main() {
+       expect(exitCode, equals(0));
+     });
+ 
++    test(
++      'portable Windows shutdown exits after databases and players close',
++      () async {
++        final callOrder = <String>[];
++        final exitCompleter = Completer<int>();
++        when(() => getIt<SettingsDb>().close()).thenAnswer((_) async {
++          callOrder.add('databaseClose');
++        });
++
++        WindowService(
++          skipWindowManagerSetup: true,
++          isMacOSOverride: () => false,
++          isPortableWindowsOverride: () => true,
++          exitOverride: (code) {
++            callOrder.add('exit');
++            exitCompleter.complete(code);
++          },
++          playerDisposerOverride: () async {
++            callOrder.add('playerDispose');
++          },
++        ).onWindowClose();
++
++        final exitCode = await exitCompleter.future;
++
++        expect(callOrder, equals(['databaseClose', 'playerDispose', 'exit']));
++        expect(exitCode, equals(0));
++      },
++    );
++
+     test('shutdown continues when the final log flush fails', () async {
+       final loggingService = MockLoggingService();
+       when(loggingService.flush).thenThrow(StateError('flush failed'));
 diff --git a/test/utils/portable_mode_test.dart b/test/utils/portable_mode_test.dart
 new file mode 100644
 index 0000000000000000000000000000000000000000..65f9342afc940f10537919603bf367d3c1306179
