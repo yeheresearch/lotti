@@ -12,7 +12,7 @@ env:
   FLUTTER_VERSION: 3.47.2
   PORTABLE_PATCH: .github/portable-patches/0001-feat-add-marker-based-Windows-portable-mode.patch
   # SHA-256 of the canonical LF patch stored in Git.
-  PORTABLE_PATCH_SHA256: 49448108fdac83c4834935fdf9a31bac680a5d4f2c4d9c0ea93e4a73768f5594
+  PORTABLE_PATCH_SHA256: 41b0dc768d096e429fa751c64aaffbc7cc4b583b4bcba191806d420524b64026
   PACKAGE_NAME: Lotti-Windows-x64-1.1.12+4390-true-portable-local-only
 
 jobs:
@@ -566,7 +566,12 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $packageDir = Get-ChildItem "$env:GITHUB_WORKSPACE\portable" -Directory | Select-Object -First 1
+          $portableRoot = "$env:GITHUB_WORKSPACE\portable"
+          if (-not (Test-Path -LiteralPath $portableRoot)) {
+            Write-Warning 'Portable directory was not assembled; no ZIP can be preserved.'
+            exit 0
+          }
+          $packageDir = Get-ChildItem $portableRoot -Directory | Select-Object -First 1
           if (-not $packageDir) {
             Write-Warning 'Portable directory was not assembled; no ZIP can be preserved.'
             exit 0

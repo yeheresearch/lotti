@@ -158,10 +158,10 @@ index b009699524ad984cdd2c8379923ead06ab839e42..da512e34cfa74a351b02993668ac18af
    // trivially exhausted (sockets, SQLite, attachments, logs). Captured
 diff --git a/lib/utils/portable_mode.dart b/lib/utils/portable_mode.dart
 new file mode 100644
-index 0000000000000000000000000000000000000000..44bdf9e129256a49441092ef858ecbbdada49229
+index 0000000000000000000000000000000000000000..6d335a75a325033a7b33f53bebf3d3d3fd5c4e74
 --- /dev/null
 +++ b/lib/utils/portable_mode.dart
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,113 @@
 +import 'dart:io';
 +
 +import 'package:path/path.dart' as p;
@@ -214,10 +214,15 @@ index 0000000000000000000000000000000000000000..44bdf9e129256a49441092ef858ecbbd
 +  // preferences stay under userdata too.
 +  final preferencesStore = SharedPreferencesStorePlatform.instance;
 +  if (preferencesStore is SharedPreferencesWindows) {
++    // The locked plugin exposes path-provider injection only through this
++    // public testing seam; using it avoids forking or upgrading the package.
++    // ignore: invalid_use_of_visible_for_testing_member
 +    preferencesStore.pathProvider = portablePathProvider;
 +  }
 +  final asyncPreferencesStore = SharedPreferencesAsyncPlatform.instance;
 +  if (asyncPreferencesStore is SharedPreferencesAsyncWindows) {
++    // See the synchronous store explanation above.
++    // ignore: invalid_use_of_visible_for_testing_member
 +    asyncPreferencesStore.pathProvider = portablePathProvider;
 +  }
 +
