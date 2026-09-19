@@ -291,6 +291,11 @@ jobs:
 
           The app runner's direct Windows Registry theme lookup was removed.
           This build does not use the Registry to store Lotti data or settings.
+          Stock Windows may still add an OS-managed Background Activity
+          Moderator (BAM) execution timestamp for lotti.exe. The package does
+          not create or control that system record; suppressing it would require
+          changing Windows services or system policy, which this package does
+          not do.
           See STORAGE-LOCATIONS.txt and PORTABLE-CHANGES.txt.
 
           The bundled Microsoft Visual C++ runtime DLLs are unmodified official
@@ -392,6 +397,9 @@ jobs:
           * Disabled device-health import in portable mode because its Windows
             device-information probe has a Registry-backed implementation.
           * Removed the runner's direct Registry read for the Windows theme.
+          * Runtime verification rejects application-controlled Registry
+            content writes. Windows BAM execution accounting is reported
+            separately because it is written by the operating system.
 
           Local task, habit, measurable, attachment, database, backup/restore,
           notification and AI features were not removed.
@@ -431,7 +439,7 @@ jobs:
               Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\native-dependencies.txt"
           }
 
-      - name: Launch, restart, storage and Registry-write smoke test
+      - name: Launch, restart, storage and Registry-content-write smoke test
         shell: pwsh
         run: |
           $sourcePackageDir = Get-ChildItem "$env:GITHUB_WORKSPACE\portable" -Directory | Select-Object -First 1
@@ -535,20 +543,49 @@ jobs:
           $events = Import-Csv $traceCsv | Where-Object { $_.'Process Name' -ieq 'lotti.exe' }
           $registryEvents = @($events | Where-Object { $_.Operation -like 'Reg*' })
           $registryEvents | Export-Csv "$env:GITHUB_WORKSPACE\logs\lotti-registry-events.csv" -NoTypeInformation
-          $registryWrites = @($registryEvents | Where-Object {
+          $registryWriteLike = @($registryEvents | Where-Object {
             $_.Operation -in @(
               'RegSetValue', 'RegCreateKey', 'RegDeleteKey', 'RegDeleteValue',
               'RegRenameKey', 'RegSetInfoKey', 'RegLoadKey', 'RegUnloadKey',
               'RegFlushKey', 'RegRestoreKey', 'RegReplaceKey'
             )
           })
+          $registryNonContentOperations = @()
+          $windowsBamWrites = @()
+          $applicationRegistryWrites = @()
+          foreach ($event in $registryWriteLike) {
+            $isReadOnlyOpen = $event.Operation -eq 'RegCreateKey' -and (
+              $event.Result -eq 'REPARSE' -or (
+                $event.Detail -match 'Desired Access: (Read|Notify)' -and
+                $event.Detail -match 'Disposition: REG_OPENED_EXISTING_KEY'
+              )
+            )
+            $isHandleTagging = $event.Operation -eq 'RegSetInfoKey' -and
+              $event.Detail -eq 'KeySetInformationClass: KeySetHandleTagsInformation, Length: 0'
+            if ($isReadOnlyOpen -or $isHandleTagging) {
+              $registryNonContentOperations += $event
+              continue
+            }
+            $isWindowsBamAccounting = $event.Operation -eq 'RegSetValue' -and
+              $event.Path -match '\\Services\\bam\\State\\UserSettings\\.*\\\\Device\\.*\\lotti\.exe$'
+            if ($isWindowsBamAccounting) {
+              $windowsBamWrites += $event
+              continue
+            }
+            $applicationRegistryWrites += $event
+          }
+          $registryWriteLike | Export-Csv "$env:GITHUB_WORKSPACE\logs\lotti-registry-write-like-events.csv" -NoTypeInformation
+          $windowsBamWrites | Export-Csv "$env:GITHUB_WORKSPACE\logs\windows-bam-execution-accounting.csv" -NoTypeInformation
           @(
             "lotti_registry_event_count=$($registryEvents.Count)"
-            "lotti_registry_write_count=$($registryWrites.Count)"
+            "registry_write_like_event_count=$($registryWriteLike.Count)"
+            "registry_non_content_operation_count=$($registryNonContentOperations.Count)"
+            "windows_bam_execution_accounting_count=$($windowsBamWrites.Count)"
+            "application_controlled_registry_write_count=$($applicationRegistryWrites.Count)"
           ) | Tee-Object "$env:GITHUB_WORKSPACE\logs\registry-runtime-summary.txt"
-          if ($registryWrites.Count -ne 0) {
-            $registryWrites | Export-Csv "$env:GITHUB_WORKSPACE\logs\lotti-registry-writes.csv" -NoTypeInformation
-            throw 'lotti.exe performed one or more Registry write operations.'
+          if ($applicationRegistryWrites.Count -ne 0) {
+            $applicationRegistryWrites | Export-Csv "$env:GITHUB_WORKSPACE\logs\lotti-application-registry-writes.csv" -NoTypeInformation
+            throw 'lotti.exe performed one or more application-controlled Registry writes.'
           }
           Remove-Item $tracePml,$traceCsv -Force -ErrorAction SilentlyContinue
 
