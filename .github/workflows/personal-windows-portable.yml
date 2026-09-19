@@ -1,0 +1,351 @@
+name: Personal Windows x64 portable build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LOTTI_TAG: 1.1.12+4390
+  LOTTI_COMMIT: 68afde71fe43f546733437264cbc07511915ea4f
+  FLUTTER_VERSION: 3.47.2
+
+jobs:
+  windows-x64:
+    name: Build and verify Windows x64 portable package
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out workflow configuration
+        uses: actions/checkout@v5
+        with:
+          path: workflow-config
+
+      - name: Configure long path and symlink support
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git config --global core.symlinks true
+
+      - name: Check out the pinned upstream release
+        uses: actions/checkout@v5
+        with:
+          repository: matthiasn/lotti
+          ref: ${{ env.LOTTI_COMMIT }}
+          path: lotti
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Prepare logs and verify pinned source
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\logs" | Out-Null
+          $actualCommit = git -C lotti rev-parse HEAD
+          if ($actualCommit -ne $env:LOTTI_COMMIT) {
+            throw "Expected $env:LOTTI_COMMIT but checked out $actualCommit"
+          }
+          $tagCommit = git -C lotti rev-list -n 1 "$env:LOTTI_TAG"
+          if ($tagCommit -ne $env:LOTTI_COMMIT) {
+            throw "Tag $env:LOTTI_TAG resolves to $tagCommit, not $env:LOTTI_COMMIT"
+          }
+          $fvm = Get-Content lotti/.fvmrc -Raw | ConvertFrom-Json
+          if ($fvm.flutter -ne $env:FLUTTER_VERSION) {
+            throw ".fvmrc pins Flutter $($fvm.flutter), not $env:FLUTTER_VERSION"
+          }
+          @(
+            "tag=$env:LOTTI_TAG"
+            "commit=$actualCommit"
+            "flutter=$($fvm.flutter)"
+            "runner=$env:RUNNER_OS $env:RUNNER_ARCH"
+            "runner_image=windows-2022"
+            "build_started_utc=$([DateTime]::UtcNow.ToString('o'))"
+          ) | Set-Content "$env:GITHUB_WORKSPACE\logs\version-source.txt" -Encoding utf8
+
+      - name: Set up pinned Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Record toolchain
+        shell: pwsh
+        run: |
+          flutter --version 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\logs\flutter-version.txt"
+          flutter doctor -v 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\logs\flutter-doctor.txt"
+          rustc --version 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\logs\rust-version.txt"
+          cargo --version 2>&1 | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\rust-version.txt"
+          cmake --version 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\logs\cmake-version.txt"
+          git --version 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\logs\git-version.txt"
+
+      - name: Resolve dependencies from the committed lockfile
+        working-directory: lotti
+        shell: pwsh
+        run: |
+          flutter pub get --enforce-lockfile 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\logs\pub-get.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Generate localization sources
+        working-directory: lotti
+        shell: pwsh
+        run: |
+          flutter gen-l10n 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\logs\gen-l10n.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Windows x64 release
+        working-directory: lotti
+        shell: pwsh
+        run: |
+          flutter config --enable-windows-desktop 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\logs\flutter-config.txt"
+          flutter build windows --release --verbose --no-pub 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\logs\build-windows.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run focused persistence and UI tests
+        id: focused_tests
+        continue-on-error: true
+        working-directory: lotti
+        shell: pwsh
+        run: |
+          $tests = @(
+            'integration_test/home_integration_test.dart',
+            'test/logic/create/create_entry_test.dart',
+            'test/pages/create/create_measurement_dialog_test.dart',
+            'test/features/habits/state/habit_completion_controller_test.dart',
+            'test/features/habits/ui/widgets/habit_completion_card_test.dart'
+          )
+          $failed = @()
+          foreach ($test in $tests) {
+            $reportName = ($test -replace '[/\\.]', '-')
+            "===== $test =====" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\focused-tests.txt"
+            flutter test $test --no-pub --file-reporter "json:$env:GITHUB_WORKSPACE\logs\$reportName.json" 2>&1 |
+              Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\focused-tests.txt"
+            if ($LASTEXITCODE -ne 0) { $failed += $test }
+          }
+          if ($failed.Count -ne 0) {
+            throw "Focused tests failed: $($failed -join ', ')"
+          }
+
+      - name: Assemble portable directory
+        shell: pwsh
+        run: |
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE 'lotti\build\windows\x64\runner\Release'
+          if (-not (Test-Path "$releaseDir\lotti.exe")) {
+            throw "Release executable not found at $releaseDir\lotti.exe"
+          }
+
+          $packageName = "Lotti-Windows-x64-$env:LOTTI_TAG"
+          $stageRoot = Join-Path $env:GITHUB_WORKSPACE 'portable'
+          $packageDir = Join-Path $stageRoot $packageName
+          New-Item -ItemType Directory -Force $packageDir | Out-Null
+          Copy-Item "$releaseDir\*" $packageDir -Recurse -Force
+
+          # App-local copies of Microsoft's official VC++ runtime make the
+          # extracted directory independent of a machine-wide VC++ install.
+          $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) {
+            throw 'A Visual Studio installation with the x64 C++ toolchain was not found.'
+          }
+          $redistBase = Join-Path $vsPath 'VC\Redist\MSVC'
+          $crtDir = Get-ChildItem $redistBase -Directory |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'x64\Microsoft.VC143.CRT' } |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+          if (-not $crtDir) {
+            throw 'Microsoft.VC143.CRT redistributable directory was not found on the official runner image.'
+          }
+          $crtFiles = Get-ChildItem "$crtDir\*.dll" -File
+          foreach ($crtFile in $crtFiles) {
+            $signature = Get-AuthenticodeSignature $crtFile.FullName
+            "$($crtFile.Name) status=$($signature.Status) signer=$($signature.SignerCertificate.Subject)" |
+              Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\vc-runtime-signatures.txt"
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+              throw "VC++ runtime signature verification failed for $($crtFile.FullName)"
+            }
+            Copy-Item $crtFile.FullName $packageDir -Force
+          }
+
+          Copy-Item 'lotti\LICENSE' "$packageDir\LICENSE-Lotti-GPL-3.0.txt" -Force
+          @'
+          Lotti Windows x64 portable package
+          ==================================
+
+          Start: double-click lotti.exe after extracting the entire directory.
+          Do not run the EXE from inside the ZIP and do not separate it from the
+          DLL and data directories next to it.
+
+          This package does not redirect or weaken Lotti's normal storage. On
+          Windows, Lotti uses the operating-system application-support directory,
+          not the extracted program directory. See STORAGE-LOCATIONS.txt.
+
+          The bundled Microsoft Visual C++ runtime DLLs are unmodified official
+          redistributable files from the GitHub-hosted Windows 2022 runner's
+          Visual Studio installation. Flutter's generated third-party notices are
+          in data\flutter_assets\NOTICES.Z.
+          '@ | Set-Content "$packageDir\README-PORTABLE.txt" -Encoding utf8
+
+          @"
+          Lotti source and license:
+            https://github.com/matthiasn/lotti
+            LICENSE-Lotti-GPL-3.0.txt
+
+          Flutter/Dart package notices generated by the pinned toolchain:
+            data\flutter_assets\NOTICES.Z
+
+          Microsoft Visual C++ 2022 x64 runtime:
+            Source on runner: $crtDir
+            Redistribution information:
+            https://learn.microsoft.com/visualstudio/releases/2022/redistribution
+
+          Every packaged file is covered by SHA256SUMS.txt. Microsoft runtime
+          signatures were checked with Get-AuthenticodeSignature during build;
+          the results are retained in the build logs.
+          "@ | Set-Content "$packageDir\RUNTIME-AND-LICENSE-SOURCES.txt" -Encoding utf8
+
+          @"
+          Upstream: https://github.com/matthiasn/lotti
+          Release tag: $env:LOTTI_TAG
+          Commit: $env:LOTTI_COMMIT
+          Flutter: $env:FLUTTER_VERSION (from upstream .fvmrc)
+          Architecture: Windows x64
+          Build type: release
+          Built on: GitHub Actions windows-2022
+          Build time UTC: $([DateTime]::UtcNow.ToString('o'))
+          Source changes: none; the binary was built from the exact upstream commit above.
+          "@ | Set-Content "$packageDir\VERSION.txt" -Encoding utf8
+
+          @'
+          User data root:
+            %APPDATA%\com.matthiasnehlsen\Lotti
+
+          The exact root is selected by Flutter path_provider's
+          getApplicationSupportDirectory() on Windows and the executable's
+          CompanyName/ProductName metadata. Lotti registers this as the active
+          profile root.
+
+          Important files below the active profile root:
+            db.sqlite                 journal, tasks, habits and measurements
+            settings.sqlite           profile-local settings
+            sync.sqlite               sync outbox and local progress
+            agent.sqlite              agent state and history
+            ai_config.sqlite           AI provider/model/profile definitions
+            ai_consumption.sqlite      local AI usage ledger
+            editor_drafts_db.sqlite    unsaved editor drafts
+            notifications.sqlite       notification state
+            onboarding_metrics.sqlite  onboarding progress
+            day_processing.sqlite      Daily OS durable work
+            fts5_db.sqlite             rebuildable full-text index
+            matrix\lotti_sync.db       Matrix session/encryption state
+            audio\                     audio attachments
+            images\                    image attachments
+            logs\                      diagnostic logs
+
+          profiles.json is stored at the user-data root. Guest profiles, when
+          created, live under guest_profiles\<profile-id> and have their own
+          copies of the profile files above.
+
+          The pinned flutter_secure_storage Windows implementation stores
+          current secrets in flutter_secure_storage.dat in this application-
+          support directory, encrypted with Windows DPAPI for the signed-in
+          Windows user. It also retains backward-compatible access to legacy
+          Windows Credential Manager entries. Matrix state and encryption keys
+          are additionally present in matrix\lotti_sync.db. None of these files
+          are stored in the extracted program directory.
+
+          Extracting or moving the program ZIP does not move or erase user data.
+          Do not delete the application-support directory unless you intend to
+          delete the local Lotti profile.
+          '@ | Set-Content "$packageDir\STORAGE-LOCATIONS.txt" -Encoding utf8
+
+          Get-ChildItem $packageDir -Recurse -File |
+            ForEach-Object {
+              $relative = $_.FullName.Substring($packageDir.Length + 1)
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $relative"
+            } |
+            Sort-Object |
+            Set-Content "$packageDir\SHA256SUMS.txt" -Encoding ascii
+
+          "package_dir=$packageDir" | Tee-Object "$env:GITHUB_WORKSPACE\logs\package.txt"
+          "release_source=$releaseDir" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\package.txt"
+          "vc_runtime_source=$crtDir" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\package.txt"
+          Get-ChildItem $packageDir -Recurse -File |
+            Select-Object FullName,Length |
+            Format-Table -AutoSize |
+            Out-String -Width 4096 |
+            Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\package.txt"
+
+      - name: Scan native dependencies
+        shell: pwsh
+        run: |
+          $packageDir = Get-ChildItem "$env:GITHUB_WORKSPACE\portable" -Directory | Select-Object -First 1
+          $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe not found' }
+          foreach ($binary in Get-ChildItem $packageDir.FullName -File | Where-Object Extension -in '.exe','.dll') {
+            "===== $($binary.Name) =====" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\native-dependencies.txt"
+            & $dumpbin.FullName /DEPENDENTS $binary.FullName 2>&1 |
+              Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\native-dependencies.txt"
+          }
+
+      - name: Launch smoke test
+        shell: pwsh
+        run: |
+          $packageDir = Get-ChildItem "$env:GITHUB_WORKSPACE\portable" -Directory | Select-Object -First 1
+          $exe = Join-Path $packageDir.FullName 'lotti.exe'
+          $process = Start-Process -FilePath $exe -WorkingDirectory $packageDir.FullName -PassThru
+          "pid=$($process.Id)" | Tee-Object "$env:GITHUB_WORKSPACE\logs\launch-smoke.txt"
+          Start-Sleep -Seconds 20
+          $process.Refresh()
+          if ($process.HasExited) {
+            "exited=true exit_code=$($process.ExitCode)" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\launch-smoke.txt"
+            throw "lotti.exe exited during the 20-second launch smoke test with code $($process.ExitCode)"
+          }
+          "exited=false running_after_seconds=20" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\launch-smoke.txt"
+          Stop-Process -Id $process.Id -Force
+          Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
+
+      - name: Create ZIP and checksum
+        shell: pwsh
+        run: |
+          $packageDir = Get-ChildItem "$env:GITHUB_WORKSPACE\portable" -Directory | Select-Object -First 1
+          $zipPath = "$($packageDir.FullName).zip"
+          Compress-Archive -Path $packageDir.FullName -DestinationPath $zipPath -CompressionLevel Optimal
+          $zipHash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$zipHash  $([IO.Path]::GetFileName($zipPath))" |
+            Set-Content "$zipPath.sha256" -Encoding ascii
+          "zip=$zipPath" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\package.txt"
+          "zip_sha256=$zipHash" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\package.txt"
+          "build_finished_utc=$([DateTime]::UtcNow.ToString('o'))" |
+            Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\version-source.txt"
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lotti-Windows-x64-1.1.12+4390
+          path: |
+            portable/Lotti-Windows-x64-1.1.12+4390.zip
+            portable/Lotti-Windows-x64-1.1.12+4390.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build and verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lotti-Windows-x64-1.1.12+4390-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce focused test result
+        if: always() && steps.focused_tests.outcome == 'failure'
+        shell: pwsh
+        run: throw 'One or more focused persistence/UI tests failed; see the uploaded logs.'
