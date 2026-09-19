@@ -94,7 +94,7 @@ index 9f152dfe7..8a6031552 100644
      else if (enableMatrix)
        branch(
 diff --git a/lib/features/sync/secure_storage.dart b/lib/features/sync/secure_storage.dart
-index 3662e8aa4..a7bee7c78 100644
+index 3662e8aa4..ee4fd17ff 100644
 --- a/lib/features/sync/secure_storage.dart
 +++ b/lib/features/sync/secure_storage.dart
 @@ -1,19 +1,25 @@
@@ -121,7 +121,7 @@ index 3662e8aa4..a7bee7c78 100644
    final _state = <String, String>{};
 +  // In flutter_secure_storage 10.3.2 this keeps
 +  // useBackwardCompatibility=false, so Credential Manager is never queried.
-+  static const _windowsOptions = WindowsOptions.defaultOptions;
++  static const WindowsOptions _windowsOptions = WindowsOptions.defaultOptions;
  
    /// Returns the value for [key], reading from the keychain on a cache miss
    /// and memoising the result. `null` when the key is absent in both the cache
