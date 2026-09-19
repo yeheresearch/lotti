@@ -12,7 +12,7 @@ env:
   FLUTTER_VERSION: 3.47.2
   PORTABLE_PATCH: .github/portable-patches/0001-feat-add-marker-based-Windows-portable-mode.patch
   # SHA-256 of the canonical LF patch stored in Git.
-  PORTABLE_PATCH_SHA256: d62cd21a56bda9a440360502bf3b3f396fb32df5fea4305aba6da7cd11b07d2d
+  PORTABLE_PATCH_SHA256: bced8296900d15476bf27b9279139004e56834ff18f8cc46b5612787fe126880
   PACKAGE_NAME: Lotti-Windows-x64-1.1.12+4390-true-portable-local-only
 
 jobs:

@@ -94,7 +94,7 @@ index 9f152dfe7..8a6031552 100644
      else if (enableMatrix)
        branch(
 diff --git a/lib/features/sync/secure_storage.dart b/lib/features/sync/secure_storage.dart
-index 3662e8aa4..bcc7920bb 100644
+index 3662e8aa4..a7bee7c78 100644
 --- a/lib/features/sync/secure_storage.dart
 +++ b/lib/features/sync/secure_storage.dart
 @@ -1,19 +1,25 @@
@@ -119,9 +119,9 @@ index 3662e8aa4..bcc7920bb 100644
  
    final _storage = const FlutterSecureStorage();
    final _state = <String, String>{};
-+  static const _windowsOptions = WindowsOptions(
-+    useBackwardCompatibility: false,
-+  );
++  // In flutter_secure_storage 10.3.2 this keeps
++  // useBackwardCompatibility=false, so Credential Manager is never queried.
++  static const _windowsOptions = WindowsOptions.defaultOptions;
  
    /// Returns the value for [key], reading from the keychain on a cache miss
    /// and memoising the result. `null` when the key is absent in both the cache
@@ -325,14 +325,13 @@ index ab4c58cfd..90ed796a9 100644
          profile: profileOfType(ProfileType.real),
 diff --git a/test/utils/portable_mode_test.dart b/test/utils/portable_mode_test.dart
 new file mode 100644
-index 000000000..dcca5b5a5
+index 000000000..e02fcd99d
 --- /dev/null
 +++ b/test/utils/portable_mode_test.dart
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,35 @@
 +import 'package:flutter_test/flutter_test.dart';
-+import 'package:path/path.dart' as p;
-+import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 +import 'package:lotti/utils/portable_mode.dart';
++import 'package:path/path.dart' as p;
 +
 +void main() {
 +  test(
