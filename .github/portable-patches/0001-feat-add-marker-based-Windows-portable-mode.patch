@@ -1,26 +1,5 @@
-From b6ee48cb056a6a8fe0f5ac7ccee5775f07831c67 Mon Sep 17 00:00:00 2001
-From: Codex <codex@localhost>
-Date: Sat, 19 Sep 2026 10:29:44 +0800
-Subject: [PATCH] feat: add marker-based Windows portable mode
-
----
- lib/app_bootstrap.dart                        |  2 +
- .../profiles/model/profile_context.dart       | 11 +++
- .../domain/settings_tree_data.dart            |  3 +-
- lib/features/sync/secure_storage.dart         | 13 ++-
- lib/main.dart                                 |  5 +
- lib/utils/portable_mode.dart                  | 91 +++++++++++++++++++
- pubspec.lock                                  |  2 +-
- pubspec.yaml                                  |  2 +-
- .../profiles/model/profile_context_test.dart  | 12 +++
- test/utils/portable_mode_test.dart            | 33 +++++++
- windows/runner/win32_window.cpp               | 25 +----
- 11 files changed, 174 insertions(+), 25 deletions(-)
- create mode 100644 lib/utils/portable_mode.dart
- create mode 100644 test/utils/portable_mode_test.dart
-
 diff --git a/lib/app_bootstrap.dart b/lib/app_bootstrap.dart
-index 64bda02f4..fe7c1788d 100644
+index 64bda02f404de9100872317012cafb39d56b0d03..fe7c1788dc7bcf6a413426e1e6a87a7a1cb831a7 100644
 --- a/lib/app_bootstrap.dart
 +++ b/lib/app_bootstrap.dart
 @@ -37,6 +37,7 @@ import 'package:lotti/services/logging_service.dart';
@@ -40,7 +19,7 @@ index 64bda02f4..fe7c1788d 100644
  
    getIt
 diff --git a/lib/features/profiles/model/profile_context.dart b/lib/features/profiles/model/profile_context.dart
-index cf3b14368..7b1ef5222 100644
+index cf3b14368ff526c56ab8b6cb9e26eb069df33f8c..7b1ef5222c104ab80efcc36786af7bf456645493 100644
 --- a/lib/features/profiles/model/profile_context.dart
 +++ b/lib/features/profiles/model/profile_context.dart
 @@ -18,6 +18,14 @@ class ProfileCapabilities {
@@ -74,7 +53,7 @@ index cf3b14368..7b1ef5222 100644
    );
  
 diff --git a/lib/features/settings_v2/domain/settings_tree_data.dart b/lib/features/settings_v2/domain/settings_tree_data.dart
-index 9f152dfe7..8a6031552 100644
+index 9f152dfe7be736f865a7a11b47dc0fb4ae50bb0f..8a6031552ce85967443d9f6db77876a19800fdd7 100644
 --- a/lib/features/settings_v2/domain/settings_tree_data.dart
 +++ b/lib/features/settings_v2/domain/settings_tree_data.dart
 @@ -1,5 +1,6 @@
@@ -94,7 +73,7 @@ index 9f152dfe7..8a6031552 100644
      else if (enableMatrix)
        branch(
 diff --git a/lib/features/sync/secure_storage.dart b/lib/features/sync/secure_storage.dart
-index 3662e8aa4..ee4fd17ff 100644
+index 3662e8aa43ae8f7150f611ccd3ad8ec00359a45c..ee4fd17ff77c2af7f2195a37ad8f0d9c0f8bd91a 100644
 --- a/lib/features/sync/secure_storage.dart
 +++ b/lib/features/sync/secure_storage.dart
 @@ -1,19 +1,25 @@
@@ -150,7 +129,7 @@ index 3662e8aa4..ee4fd17ff 100644
    }
  }
 diff --git a/lib/main.dart b/lib/main.dart
-index b00969952..dd726521c 100644
+index b009699524ad984cdd2c8379923ead06ab839e42..da512e34cfa74a351b02993668ac18af0643452c 100644
 --- a/lib/main.dart
 +++ b/lib/main.dart
 @@ -11,6 +11,7 @@ import 'package:lotti/get_it.dart';
@@ -161,10 +140,15 @@ index b00969952..dd726521c 100644
  import 'package:material_ui/material_ui.dart';
  
  class AppConstants {
-@@ -49,6 +50,10 @@ void handleTimezoneConfigurationError(Object error, StackTrace stackTrace) {
+@@ -49,6 +50,15 @@ void handleTimezoneConfigurationError(Object error, StackTrace stackTrace) {
  // error machinery below).
  // coverage:ignore-start
  Future<void> main() async {
++  // Desktop plugin registration installs the default path_provider platform
++  // implementation. Override it only afterwards so the portable adapter
++  // remains active for the rest of startup.
++  WidgetsFlutterBinding.ensureInitialized();
++
 +  // A marker-enabled Windows build must redirect platform paths before any
 +  // logger, preference store, database, or secure-storage client is created.
 +  configurePortableMode();
@@ -174,7 +158,7 @@ index b00969952..dd726521c 100644
    // trivially exhausted (sockets, SQLite, attachments, logs). Captured
 diff --git a/lib/utils/portable_mode.dart b/lib/utils/portable_mode.dart
 new file mode 100644
-index 000000000..ec9322ad3
+index 0000000000000000000000000000000000000000..ec9322ad3655e90a6109326826b3a1042feb64d4
 --- /dev/null
 +++ b/lib/utils/portable_mode.dart
 @@ -0,0 +1,89 @@
@@ -268,7 +252,7 @@ index 000000000..ec9322ad3
 +  }) async => [_dataRoot];
 +}
 diff --git a/pubspec.lock b/pubspec.lock
-index 60186e44b..6603ab506 100644
+index 60186e44b9c9a293fc3ea2cf58495c28ca07cc15..6603ab506d5517bd35bf3282f34b7f9576758236 100644
 --- a/pubspec.lock
 +++ b/pubspec.lock
 @@ -2139,7 +2139,7 @@ packages:
@@ -281,7 +265,7 @@ index 60186e44b..6603ab506 100644
        name: path_provider_platform_interface
        sha256: "484838772624c3a4b94f1e44a3e19897fee738f2d5c4ce448443b0417f7c9dda"
 diff --git a/pubspec.yaml b/pubspec.yaml
-index 94be0216d..2b9b119ed 100644
+index 94be0216db5997de511666fae2027f4223eebb11..2b9b119eda817011fcf4f7e035d694d3e64d45fe 100644
 --- a/pubspec.yaml
 +++ b/pubspec.yaml
 @@ -109,6 +109,7 @@ dependencies:
@@ -301,7 +285,7 @@ index 94be0216d..2b9b119ed 100644
    plugin_platform_interface: any
    share_plus_platform_interface: any
 diff --git a/test/features/profiles/model/profile_context_test.dart b/test/features/profiles/model/profile_context_test.dart
-index ab4c58cfd..90ed796a9 100644
+index ab4c58cfdbc69fded5684069ff0ebb0cdc83f5d8..90ed796a9b2b2c0ec863828ae37571c9c6919347 100644
 --- a/test/features/profiles/model/profile_context_test.dart
 +++ b/test/features/profiles/model/profile_context_test.dart
 @@ -14,6 +14,18 @@ void main() {
@@ -325,7 +309,7 @@ index ab4c58cfd..90ed796a9 100644
          profile: profileOfType(ProfileType.real),
 diff --git a/test/utils/portable_mode_test.dart b/test/utils/portable_mode_test.dart
 new file mode 100644
-index 000000000..e02fcd99d
+index 0000000000000000000000000000000000000000..e02fcd99d243b77c5f30bfd6e9f4b11f78c6494a
 --- /dev/null
 +++ b/test/utils/portable_mode_test.dart
 @@ -0,0 +1,35 @@
@@ -365,7 +349,7 @@ index 000000000..e02fcd99d
 +  );
 +}
 diff --git a/windows/runner/win32_window.cpp b/windows/runner/win32_window.cpp
-index 60608d0fe..1a9d9d3d8 100644
+index 60608d0fe5bff3a7a7e05d5a232944a1a8effe5f..1a9d9d3d8ea472f130436f6905025d438c2a2217 100644
 --- a/windows/runner/win32_window.cpp
 +++ b/windows/runner/win32_window.cpp
 @@ -18,14 +18,6 @@ namespace {
@@ -405,5 +389,3 @@ index 60608d0fe..1a9d9d3d8 100644
 +  DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
 +                        &enable_dark_mode, sizeof(enable_dark_mode));
  }
--- 
-2.53.0.windows.3
