@@ -10,6 +10,9 @@ env:
   LOTTI_TAG: 1.1.12+4390
   LOTTI_COMMIT: 68afde71fe43f546733437264cbc07511915ea4f
   FLUTTER_VERSION: 3.47.2
+  PORTABLE_PATCH: .github/portable-patches/0001-feat-add-marker-based-Windows-portable-mode.patch
+  PORTABLE_PATCH_SHA256: eb9dc4140d9ea2629f482af354a5cd7a6635a183bd5f8934219f6c380b954da7
+  PACKAGE_NAME: Lotti-Windows-x64-1.1.12+4390-true-portable-local-only
 
 jobs:
   windows-x64:
@@ -58,10 +61,66 @@ jobs:
             "tag=$env:LOTTI_TAG"
             "commit=$actualCommit"
             "flutter=$($fvm.flutter)"
+            "workflow_commit=$(git -C workflow-config rev-parse HEAD)"
             "runner=$env:RUNNER_OS $env:RUNNER_ARCH"
             "runner_image=windows-2022"
             "build_started_utc=$([DateTime]::UtcNow.ToString('o'))"
           ) | Set-Content "$env:GITHUB_WORKSPACE\logs\version-source.txt" -Encoding utf8
+
+      - name: Verify and apply the portable local-only patch
+        shell: pwsh
+        run: |
+          $patch = Join-Path "$env:GITHUB_WORKSPACE\workflow-config" $env:PORTABLE_PATCH
+          if (-not (Test-Path $patch)) { throw "Portable patch not found: $patch" }
+          $patchHash = (Get-FileHash $patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($patchHash -ne $env:PORTABLE_PATCH_SHA256) {
+            throw "Portable patch hash $patchHash does not match $env:PORTABLE_PATCH_SHA256"
+          }
+          git -C lotti apply --check $patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C lotti apply $patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $expected = @(
+            'lib/app_bootstrap.dart'
+            'lib/features/profiles/model/profile_context.dart'
+            'lib/features/settings_v2/domain/settings_tree_data.dart'
+            'lib/features/sync/secure_storage.dart'
+            'lib/main.dart'
+            'lib/utils/portable_mode.dart'
+            'pubspec.lock'
+            'pubspec.yaml'
+            'test/features/profiles/model/profile_context_test.dart'
+            'test/utils/portable_mode_test.dart'
+            'windows/runner/win32_window.cpp'
+          ) | Sort-Object
+          $actual = @(git -C lotti diff --name-only) | Sort-Object
+          if (Compare-Object $expected $actual) {
+            throw "Portable patch changed an unexpected file set: $($actual -join ', ')"
+          }
+
+          $registryCalls = Get-ChildItem lotti/windows/runner -Recurse -File |
+            Select-String -Pattern 'RegGetValue|RegSetValue|RegCreateKey|RegOpenKey|HKEY_'
+          if ($registryCalls) {
+            $registryCalls | Out-String | Tee-Object "$env:GITHUB_WORKSPACE\logs\registry-source-audit.txt"
+            throw 'Direct Windows Registry calls remain in the patched runner.'
+          }
+          $registryImports = Get-ChildItem lotti/lib -Recurse -Filter *.dart |
+            Select-String -Pattern "package:win32_registry"
+          if ($registryImports) {
+            $registryImports | Out-String | Tee-Object "$env:GITHUB_WORKSPACE\logs\registry-source-audit.txt"
+            throw 'Application Dart source imports win32_registry.'
+          }
+          @(
+            "patch=$env:PORTABLE_PATCH"
+            "patch_sha256=$patchHash"
+            'runner_direct_registry_calls=none'
+            'dart_win32_registry_imports=none'
+            'secure_storage_windows_credential_fallback=false'
+            'device_sync_capability=false'
+            'device_health_probe_capability=false'
+          ) | Tee-Object "$env:GITHUB_WORKSPACE\logs\portable-patch-audit.txt"
+          git -C lotti diff --stat | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\portable-patch-audit.txt"
 
       - name: Set up pinned Flutter SDK
         uses: subosito/flutter-action@v2
@@ -94,6 +153,30 @@ jobs:
           flutter gen-l10n 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\logs\gen-l10n.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Validate portable source changes
+        working-directory: lotti
+        shell: pwsh
+        run: |
+          dart format --output=none --set-exit-if-changed `
+            lib/app_bootstrap.dart `
+            lib/features/profiles/model/profile_context.dart `
+            lib/features/settings_v2/domain/settings_tree_data.dart `
+            lib/features/sync/secure_storage.dart `
+            lib/main.dart `
+            lib/utils/portable_mode.dart `
+            test/features/profiles/model/profile_context_test.dart `
+            test/utils/portable_mode_test.dart 2>&1 |
+            Tee-Object "$env:GITHUB_WORKSPACE\logs\portable-format.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          flutter analyze --no-pub `
+            lib/utils/portable_mode.dart `
+            lib/features/profiles/model/profile_context.dart `
+            lib/features/sync/secure_storage.dart `
+            test/utils/portable_mode_test.dart `
+            test/features/profiles/model/profile_context_test.dart 2>&1 |
+            Tee-Object "$env:GITHUB_WORKSPACE\logs\portable-analyze.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Build Windows x64 release
         working-directory: lotti
         shell: pwsh
@@ -109,6 +192,9 @@ jobs:
         shell: pwsh
         run: |
           $tests = @(
+            'test/utils/portable_mode_test.dart',
+            'test/features/profiles/model/profile_context_test.dart',
+            'test/features/settings_v2/ui/settings_tree_builder_test.dart',
             'integration_test/home_integration_test.dart',
             'test/logic/create/create_entry_test.dart',
             'test/pages/create/create_measurement_dialog_test.dart',
@@ -135,11 +221,18 @@ jobs:
             throw "Release executable not found at $releaseDir\lotti.exe"
           }
 
-          $packageName = "Lotti-Windows-x64-$env:LOTTI_TAG"
+          $packageName = $env:PACKAGE_NAME
           $stageRoot = Join-Path $env:GITHUB_WORKSPACE 'portable'
           $packageDir = Join-Path $stageRoot $packageName
           New-Item -ItemType Directory -Force $packageDir | Out-Null
           Copy-Item "$releaseDir\*" $packageDir -Recurse -Force
+          New-Item -ItemType File -Force "$packageDir\portable.mode" | Out-Null
+          New-Item -ItemType Directory -Force "$packageDir\userdata" | Out-Null
+          @'
+          This directory contains every Lotti profile, database, attachment,
+          setting, cache, temporary file, export, log, and encrypted secret
+          created by this portable package. Back up the entire directory.
+          '@ | Set-Content "$packageDir\userdata\README.txt" -Encoding utf8
 
           # App-local copies of Microsoft's official VC++ runtime make the
           # extracted directory independent of a machine-wide VC++ install.
@@ -170,16 +263,29 @@ jobs:
 
           Copy-Item 'lotti\LICENSE' "$packageDir\LICENSE-Lotti-GPL-3.0.txt" -Force
           @'
-          Lotti Windows x64 portable package
-          ==================================
+          Lotti Windows x64 true portable, local-only package
+          ==================================================
 
           Start: double-click lotti.exe after extracting the entire directory.
           Do not run the EXE from inside the ZIP and do not separate it from the
           DLL and data directories next to it.
 
-          This package does not redirect or weaken Lotti's normal storage. On
-          Windows, Lotti uses the operating-system application-support directory,
-          not the extracted program directory. See STORAGE-LOCATIONS.txt.
+          The portable.mode marker redirects application support, documents,
+          cache, temporary and export paths to the adjacent userdata directory.
+          Keep portable.mode beside lotti.exe. Device-to-device Matrix sync and
+          its UI are disabled in this personal build. No sync client, inbound or
+          outbound worker, backfill timer, device profile broadcast, or sync
+          credential read is started.
+
+          Windows secure storage remains encrypted with DPAPI, but its backing
+          file is under userdata. It is tied to the Windows account and computer
+          that encrypted it; after moving to another account/computer, re-enter
+          AI API credentials. No legacy Windows Credential Manager fallback is
+          used.
+
+          The app runner's direct Windows Registry theme lookup was removed.
+          This build does not use the Registry to store Lotti data or settings.
+          See STORAGE-LOCATIONS.txt and PORTABLE-CHANGES.txt.
 
           The bundled Microsoft Visual C++ runtime DLLs are unmodified official
           redistributable files from the GitHub-hosted Windows 2022 runner's
@@ -214,22 +320,30 @@ jobs:
           Build type: release
           Built on: GitHub Actions windows-2022
           Build time UTC: $([DateTime]::UtcNow.ToString('o'))
-          Source changes: none; the binary was built from the exact upstream commit above.
+          Portable patch: $env:PORTABLE_PATCH
+          Portable patch SHA256: $env:PORTABLE_PATCH_SHA256
+          Workflow source commit: $(git -C workflow-config rev-parse HEAD)
+          Source base is the exact upstream commit above; only the separately
+          hashed portable/local-only patch was applied.
           "@ | Set-Content "$packageDir\VERSION.txt" -Encoding utf8
 
           @'
           User data root:
-            %APPDATA%\com.matthiasnehlsen\Lotti
+            <directory containing lotti.exe>\userdata
 
-          The exact root is selected by Flutter path_provider's
-          getApplicationSupportDirectory() on Windows and the executable's
-          CompanyName/ProductName metadata. Lotti registers this as the active
-          profile root.
+          The portable.mode marker next to lotti.exe is checked before logging,
+          preferences, databases, or secure storage initialize. All path_provider
+          storage classes are redirected below userdata:
+            application support/documents/library  userdata\
+            cache                                  userdata\cache\
+            temporary files                        userdata\temp\
+            downloads/exports                      userdata\exports\
 
           Important files below the active profile root:
             db.sqlite                 journal, tasks, habits and measurements
             settings.sqlite           profile-local settings
-            sync.sqlite               sync outbox and local progress
+            sync.sqlite               local compatibility metadata only;
+                                      no device-sync worker is registered
             agent.sqlite              agent state and history
             ai_config.sqlite           AI provider/model/profile definitions
             ai_consumption.sqlite      local AI usage ledger
@@ -238,7 +352,6 @@ jobs:
             onboarding_metrics.sqlite  onboarding progress
             day_processing.sqlite      Daily OS durable work
             fts5_db.sqlite             rebuildable full-text index
-            matrix\lotti_sync.db       Matrix session/encryption state
             audio\                     audio attachments
             images\                    image attachments
             logs\                      diagnostic logs
@@ -247,18 +360,36 @@ jobs:
           created, live under guest_profiles\<profile-id> and have their own
           copies of the profile files above.
 
-          The pinned flutter_secure_storage Windows implementation stores
-          current secrets in flutter_secure_storage.dat in this application-
-          support directory, encrypted with Windows DPAPI for the signed-in
-          Windows user. It also retains backward-compatible access to legacy
-          Windows Credential Manager entries. Matrix state and encryption keys
-          are additionally present in matrix\lotti_sync.db. None of these files
-          are stored in the extracted program directory.
+          The pinned flutter_secure_storage Windows implementation stores AI
+          secrets in userdata\flutter_secure_storage.dat, encrypted with Windows
+          DPAPI for the signed-in Windows user. Backward-compatible access to
+          Windows Credential Manager is explicitly disabled. Device-to-device
+          Matrix sync is disabled, so Matrix credentials are not read and no
+          Matrix session database is created by this build.
 
-          Extracting or moving the program ZIP does not move or erase user data.
-          Do not delete the application-support directory unless you intend to
-          delete the local Lotti profile.
+          Lotti data and settings are not stored under %APPDATA% or
+          %LOCALAPPDATA%. Moving the whole extracted directory moves ordinary
+          databases and attachments; DPAPI secrets must be re-entered on a
+          different Windows account or computer.
           '@ | Set-Content "$packageDir\STORAGE-LOCATIONS.txt" -Encoding utf8
+
+          @'
+          Necessary portable/local-only modifications
+          ===========================================
+
+          * Added an opt-in portable.mode marker checked before service startup.
+          * Redirected all path_provider storage classes under userdata.
+          * Explicitly disabled flutter_secure_storage's legacy Windows
+            Credential Manager fallback; the DPAPI-encrypted file stays local.
+          * Disabled Matrix device sync structurally: no Matrix client, sync
+            service, outbox transport, backfill, broadcast, or sync UI.
+          * Disabled device-health import in portable mode because its Windows
+            device-information probe has a Registry-backed implementation.
+          * Removed the runner's direct Registry read for the Windows theme.
+
+          Local task, habit, measurable, attachment, database, backup/restore,
+          notification and AI features were not removed.
+          '@ | Set-Content "$packageDir\PORTABLE-CHANGES.txt" -Encoding utf8
 
           Get-ChildItem $packageDir -Recurse -File |
             ForEach-Object {
@@ -294,11 +425,42 @@ jobs:
               Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\native-dependencies.txt"
           }
 
-      - name: Launch smoke test
+      - name: Launch, restart, storage and Registry-write smoke test
         shell: pwsh
         run: |
-          $packageDir = Get-ChildItem "$env:GITHUB_WORKSPACE\portable" -Directory | Select-Object -First 1
+          $sourcePackageDir = Get-ChildItem "$env:GITHUB_WORKSPACE\portable" -Directory | Select-Object -First 1
+          $smokePath = Join-Path $env:RUNNER_TEMP 'lotti-portable-smoke'
+          Copy-Item $sourcePackageDir.FullName $smokePath -Recurse -Force
+          $packageDir = Get-Item $smokePath
           $exe = Join-Path $packageDir.FullName 'lotti.exe'
+          $dataRoot = Join-Path $packageDir.FullName 'userdata'
+          $roamingRoot = Join-Path $env:APPDATA 'com.matthiasnehlsen\Lotti'
+          $localRoot = Join-Path $env:LOCALAPPDATA 'com.matthiasnehlsen\Lotti'
+          if (Test-Path $roamingRoot) { throw "Unexpected pre-existing test path: $roamingRoot" }
+          if (Test-Path $localRoot) { throw "Unexpected pre-existing test path: $localRoot" }
+
+          cmdkey.exe /list | Set-Content "$env:GITHUB_WORKSPACE\logs\credentials-before.txt" -Encoding utf8
+
+          # Microsoft Sysinternals Process Monitor is used only as a verifier.
+          # It is not included in the resulting package.
+          $procmonZip = "$env:GITHUB_WORKSPACE\procmon.zip"
+          $procmonDir = "$env:GITHUB_WORKSPACE\procmon"
+          Invoke-WebRequest 'https://download.sysinternals.com/files/ProcessMonitor.zip' -OutFile $procmonZip
+          Expand-Archive $procmonZip $procmonDir -Force
+          $procmon = Join-Path $procmonDir 'Procmon64.exe'
+          $signature = Get-AuthenticodeSignature $procmon
+          "status=$($signature.Status) signer=$($signature.SignerCertificate.Subject)" |
+            Tee-Object "$env:GITHUB_WORKSPACE\logs\procmon-signature.txt"
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw 'Process Monitor signature verification failed.'
+          }
+          $tracePml = "$env:GITHUB_WORKSPACE\logs\launch-registry-trace.pml"
+          $traceCsv = "$env:GITHUB_WORKSPACE\logs\launch-registry-trace.csv"
+          Start-Process -FilePath $procmon -ArgumentList @(
+            '/AcceptEula', '/Quiet', '/Minimized', '/BackingFile', $tracePml
+          )
+          Start-Sleep -Seconds 2
+
           $process = Start-Process -FilePath $exe -WorkingDirectory $packageDir.FullName -PassThru
           "pid=$($process.Id)" | Tee-Object "$env:GITHUB_WORKSPACE\logs\launch-smoke.txt"
           Start-Sleep -Seconds 20
@@ -308,8 +470,78 @@ jobs:
             throw "lotti.exe exited during the 20-second launch smoke test with code $($process.ExitCode)"
           }
           "exited=false running_after_seconds=20" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\launch-smoke.txt"
-          Stop-Process -Id $process.Id -Force
-          Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
+          if (-not (Test-Path "$dataRoot\db.sqlite")) {
+            throw 'Portable journal database was not created under userdata.'
+          }
+          if (-not (Test-Path "$dataRoot\settings.sqlite")) {
+            throw 'Portable settings database was not created under userdata.'
+          }
+          if (Test-Path "$dataRoot\matrix") {
+            throw 'Matrix state directory was created even though device sync is disabled.'
+          }
+          if (Test-Path $roamingRoot) { throw "App wrote outside package: $roamingRoot" }
+          if (Test-Path $localRoot) { throw "App wrote outside package: $localRoot" }
+
+          $null = $process.CloseMainWindow()
+          if (-not $process.WaitForExit(15000)) {
+            Stop-Process -Id $process.Id -Force
+            throw 'First launch did not close cleanly within 15 seconds.'
+          }
+          "first_exit_code=$($process.ExitCode)" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\launch-smoke.txt"
+
+          $databaseLength = (Get-Item "$dataRoot\db.sqlite").Length
+          $restart = Start-Process -FilePath $exe -WorkingDirectory $packageDir.FullName -PassThru
+          "restart_pid=$($restart.Id)" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\launch-smoke.txt"
+          Start-Sleep -Seconds 12
+          $restart.Refresh()
+          if ($restart.HasExited) {
+            throw "lotti.exe exited during restart smoke test with code $($restart.ExitCode)"
+          }
+          if ((Get-Item "$dataRoot\db.sqlite").Length -lt $databaseLength) {
+            throw 'Journal database shrank unexpectedly across restart.'
+          }
+          if (Test-Path $roamingRoot) { throw "Restart wrote outside package: $roamingRoot" }
+          if (Test-Path $localRoot) { throw "Restart wrote outside package: $localRoot" }
+          $null = $restart.CloseMainWindow()
+          if (-not $restart.WaitForExit(15000)) {
+            Stop-Process -Id $restart.Id -Force
+            throw 'Restart did not close cleanly within 15 seconds.'
+          }
+          "restart_exit_code=$($restart.ExitCode)" | Tee-Object -Append "$env:GITHUB_WORKSPACE\logs\launch-smoke.txt"
+
+          Start-Process -FilePath $procmon -ArgumentList '/Terminate' -Wait
+          Start-Process -FilePath $procmon -ArgumentList @(
+            '/AcceptEula', '/Quiet', '/OpenLog', $tracePml, '/SaveAs', $traceCsv
+          ) -Wait
+          $events = Import-Csv $traceCsv | Where-Object { $_.'Process Name' -ieq 'lotti.exe' }
+          $registryEvents = @($events | Where-Object { $_.Operation -like 'Reg*' })
+          $registryEvents | Export-Csv "$env:GITHUB_WORKSPACE\logs\lotti-registry-events.csv" -NoTypeInformation
+          $registryWrites = @($registryEvents | Where-Object {
+            $_.Operation -in @(
+              'RegSetValue', 'RegCreateKey', 'RegDeleteKey', 'RegDeleteValue',
+              'RegRenameKey', 'RegSetInfoKey', 'RegLoadKey', 'RegUnloadKey',
+              'RegFlushKey', 'RegRestoreKey', 'RegReplaceKey'
+            )
+          })
+          @(
+            "lotti_registry_event_count=$($registryEvents.Count)"
+            "lotti_registry_write_count=$($registryWrites.Count)"
+          ) | Tee-Object "$env:GITHUB_WORKSPACE\logs\registry-runtime-summary.txt"
+          if ($registryWrites.Count -ne 0) {
+            $registryWrites | Export-Csv "$env:GITHUB_WORKSPACE\logs\lotti-registry-writes.csv" -NoTypeInformation
+            throw 'lotti.exe performed one or more Registry write operations.'
+          }
+          Remove-Item $tracePml,$traceCsv -Force -ErrorAction SilentlyContinue
+
+          cmdkey.exe /list | Set-Content "$env:GITHUB_WORKSPACE\logs\credentials-after.txt" -Encoding utf8
+          $credentialsBefore = Get-Content "$env:GITHUB_WORKSPACE\logs\credentials-before.txt" -Raw
+          $credentialsAfter = Get-Content "$env:GITHUB_WORKSPACE\logs\credentials-after.txt" -Raw
+          if ($credentialsBefore -ne $credentialsAfter) {
+            throw 'Windows Credential Manager changed during the portable launch test.'
+          }
+          Get-ChildItem $dataRoot -Recurse -File |
+            Select-Object FullName,Length,LastWriteTimeUtc |
+            Export-Csv "$env:GITHUB_WORKSPACE\logs\portable-userdata-after-restart.csv" -NoTypeInformation
 
       - name: Create ZIP and checksum
         shell: pwsh
@@ -328,10 +560,10 @@ jobs:
       - name: Upload portable ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: Lotti-Windows-x64-1.1.12+4390
+          name: ${{ env.PACKAGE_NAME }}
           path: |
-            portable/Lotti-Windows-x64-1.1.12+4390.zip
-            portable/Lotti-Windows-x64-1.1.12+4390.zip.sha256
+            portable/${{ env.PACKAGE_NAME }}.zip
+            portable/${{ env.PACKAGE_NAME }}.zip.sha256
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
@@ -340,7 +572,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Lotti-Windows-x64-1.1.12+4390-logs
+          name: ${{ env.PACKAGE_NAME }}-logs
           path: logs/
           if-no-files-found: warn
           retention-days: 14
