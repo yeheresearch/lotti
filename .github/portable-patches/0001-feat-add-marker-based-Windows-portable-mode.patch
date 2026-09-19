@@ -1,0 +1,410 @@
+From b6ee48cb056a6a8fe0f5ac7ccee5775f07831c67 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Sat, 19 Sep 2026 10:29:44 +0800
+Subject: [PATCH] feat: add marker-based Windows portable mode
+
+---
+ lib/app_bootstrap.dart                        |  2 +
+ .../profiles/model/profile_context.dart       | 11 +++
+ .../domain/settings_tree_data.dart            |  3 +-
+ lib/features/sync/secure_storage.dart         | 13 ++-
+ lib/main.dart                                 |  5 +
+ lib/utils/portable_mode.dart                  | 91 +++++++++++++++++++
+ pubspec.lock                                  |  2 +-
+ pubspec.yaml                                  |  2 +-
+ .../profiles/model/profile_context_test.dart  | 12 +++
+ test/utils/portable_mode_test.dart            | 33 +++++++
+ windows/runner/win32_window.cpp               | 25 +----
+ 11 files changed, 174 insertions(+), 25 deletions(-)
+ create mode 100644 lib/utils/portable_mode.dart
+ create mode 100644 test/utils/portable_mode_test.dart
+
+diff --git a/lib/app_bootstrap.dart b/lib/app_bootstrap.dart
+index 64bda02f4..fe7c1788d 100644
+--- a/lib/app_bootstrap.dart
++++ b/lib/app_bootstrap.dart
+@@ -37,6 +37,7 @@ import 'package:lotti/services/logging_service.dart';
+ import 'package:lotti/services/window_service.dart';
+ import 'package:lotti/utils/file_utils.dart';
+ import 'package:lotti/utils/platform.dart';
++import 'package:lotti/utils/portable_mode.dart';
+ import 'package:lotti/utils/timezone.dart';
+ import 'package:lotti/widgets/media/image_viewer_orientation_scope.dart';
+ import 'package:material_ui/material_ui.dart';
+@@ -185,6 +186,7 @@ Future<ProfileContext> bootstrapProfileServices(
+   final context = ProfileContext.forProfile(
+     profile: info.active,
+     root: info.activeRoot,
++    portableMode: isPortableModeActive,
+   );
+ 
+   getIt
+diff --git a/lib/features/profiles/model/profile_context.dart b/lib/features/profiles/model/profile_context.dart
+index cf3b14368..7b1ef5222 100644
+--- a/lib/features/profiles/model/profile_context.dart
++++ b/lib/features/profiles/model/profile_context.dart
+@@ -18,6 +18,14 @@ class ProfileCapabilities {
+     healthImportEnabled: true,
+   );
+ 
++  /// Marker-enabled portable builds are deliberately local-only. Matrix sync
++  /// and device-health imports are structurally excluded so their Windows
++  /// device-information probes cannot escape the portable data boundary.
++  static const ProfileCapabilities portable = ProfileCapabilities(
++    syncEnabled: false,
++    healthImportEnabled: false,
++  );
++
+   /// Guest worlds: no sync stack (own host ID, zero outbox traffic, never
+   /// reads Matrix credentials), no health import (device health data must
+   /// not bleed into a play world).
+@@ -45,11 +53,14 @@ class ProfileContext {
+   factory ProfileContext.forProfile({
+     required Profile profile,
+     required Directory root,
++    bool portableMode = false,
+   }) => ProfileContext(
+     profile: profile,
+     root: root,
+     capabilities: profile.isGuest
+         ? ProfileCapabilities.guest
++        : portableMode
++        ? ProfileCapabilities.portable
+         : ProfileCapabilities.real,
+   );
+ 
+diff --git a/lib/features/settings_v2/domain/settings_tree_data.dart b/lib/features/settings_v2/domain/settings_tree_data.dart
+index 9f152dfe7..8a6031552 100644
+--- a/lib/features/settings_v2/domain/settings_tree_data.dart
++++ b/lib/features/settings_v2/domain/settings_tree_data.dart
+@@ -1,5 +1,6 @@
+ import 'package:lotti/features/design_system/theme/design_tokens.dart';
+ import 'package:lotti/features/settings_v2/domain/settings_node.dart';
++import 'package:lotti/utils/portable_mode.dart';
+ import 'package:material_ui/material_ui.dart';
+ 
+ /// (title, desc) pair resolved for a single tree node.
+@@ -153,7 +154,7 @@ List<SettingsNode> buildSettingsTree({
+     // the tree never routes anywhere that would resolve the absent
+     // MatrixService. The tile shows regardless of `enableMatrix` because
+     // the flag row itself is filtered out of the Flags page in demo mode.
+-    if (!syncFeatureAvailable)
++    if (!syncFeatureAvailable && !isPortableModeActive)
+       leaf('sync-unavailable', LottiIcons.syncProblem)
+     else if (enableMatrix)
+       branch(
+diff --git a/lib/features/sync/secure_storage.dart b/lib/features/sync/secure_storage.dart
+index 3662e8aa4..bcc7920bb 100644
+--- a/lib/features/sync/secure_storage.dart
++++ b/lib/features/sync/secure_storage.dart
+@@ -1,19 +1,25 @@
+ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+ import 'package:package_info_plus/package_info_plus.dart';
+ 
+-/// Read-through cache over the platform keychain ([FlutterSecureStorage]) for
+-/// sync secrets (the Matrix config JSON, etc.).
++/// Read-through cache over [FlutterSecureStorage] for sync and AI secrets.
+ ///
+ /// Values are namespaced by the app's package name (iOS/macOS `accountName`)
+ /// so multiple build flavours do not collide in the shared keychain. The
+ /// in-memory [_state] map caches the first read of each key for the process
+ /// lifetime; [writeValue] deletes before writing to keep the cache and the
+ /// backing store consistent.
++///
++/// Windows compatibility fallback is explicitly disabled. In portable mode
++/// this keeps the DPAPI-encrypted backing file under `userdata` and prevents
++/// reads from or writes to the legacy Windows Credential Manager store.
+ class SecureStorage {
+   SecureStorage();
+ 
+   final _storage = const FlutterSecureStorage();
+   final _state = <String, String>{};
++  static const _windowsOptions = WindowsOptions(
++    useBackwardCompatibility: false,
++  );
+ 
+   /// Returns the value for [key], reading from the keychain on a cache miss
+   /// and memoising the result. `null` when the key is absent in both the cache
+@@ -31,6 +37,7 @@ class SecureStorage {
+         mOptions: MacOsOptions(
+           accountName: info.packageName,
+         ),
++        wOptions: _windowsOptions,
+       );
+       if (fromSecureStorage != null) {
+         _state[key] = fromSecureStorage;
+@@ -61,6 +68,7 @@ class SecureStorage {
+       mOptions: MacOsOptions(
+         accountName: info.packageName,
+       ),
++      wOptions: _windowsOptions,
+     );
+   }
+ 
+@@ -83,6 +91,7 @@ class SecureStorage {
+       mOptions: MacOsOptions(
+         accountName: info.packageName,
+       ),
++      wOptions: _windowsOptions,
+     );
+   }
+ }
+diff --git a/lib/main.dart b/lib/main.dart
+index b00969952..dd726521c 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -11,6 +11,7 @@ import 'package:lotti/get_it.dart';
+ import 'package:lotti/services/domain_logging.dart';
+ import 'package:lotti/services/window_service.dart';
+ import 'package:lotti/utils/fd_limits.dart';
++import 'package:lotti/utils/portable_mode.dart';
+ import 'package:material_ui/material_ui.dart';
+ 
+ class AppConstants {
+@@ -49,6 +50,10 @@ void handleTimezoneConfigurationError(Object error, StackTrace stackTrace) {
+ // error machinery below).
+ // coverage:ignore-start
+ Future<void> main() async {
++  // A marker-enabled Windows build must redirect platform paths before any
++  // logger, preference store, database, or secure-storage client is created.
++  configurePortableMode();
++
+   // Raise the file descriptor soft limit before anything opens an FD. On
+   // macOS, GUI apps inherit launchd's legacy soft limit of 256, which is
+   // trivially exhausted (sockets, SQLite, attachments, logs). Captured
+diff --git a/lib/utils/portable_mode.dart b/lib/utils/portable_mode.dart
+new file mode 100644
+index 000000000..15efb6617
+--- /dev/null
++++ b/lib/utils/portable_mode.dart
+@@ -0,0 +1,91 @@
++import 'dart:io';
++
++import 'package:path/path.dart' as p;
++import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
++
++const portableModeMarkerFileName = 'portable.mode';
++const portableDataDirectoryName = 'userdata';
++
++bool _portableModeActive = false;
++Directory? _portableDataDirectory;
++
++/// Whether this process is running from a marker-enabled Windows portable
++/// directory.
++bool get isPortableModeActive => _portableModeActive;
++
++/// The app-local data directory while [isPortableModeActive] is true.
++Directory? get portableDataDirectory => _portableDataDirectory;
++
++/// Redirects every path-provider storage class into the extracted program
++/// directory when `portable.mode` is next to the Windows executable.
++///
++/// This must run before logging, preferences, databases, secure storage, or
++/// any other service asks path_provider for an operating-system directory.
++void configurePortableMode() {
++  if (!Platform.isWindows) return;
++
++  final executableDirectory = p.dirname(Platform.resolvedExecutable);
++  final marker = File(p.join(executableDirectory, portableModeMarkerFileName));
++  if (!marker.existsSync()) return;
++
++  final dataDirectory = Directory(
++    p.join(executableDirectory, portableDataDirectoryName),
++  )..createSync(recursive: true);
++  for (final child in const ['cache', 'temp', 'exports']) {
++    Directory(p.join(dataDirectory.path, child)).createSync(recursive: true);
++  }
++
++  PathProviderPlatform.instance = PortablePathProviderPlatform(
++    dataRoot: dataDirectory.path,
++  );
++  _portableDataDirectory = dataDirectory;
++  _portableModeActive = true;
++}
++
++/// Path-provider adapter used by the marker-enabled Windows package.
++///
++/// Downloads are deliberately redirected too: exports made through a path
++/// provider stay beside the application rather than leaking into the Windows
++/// profile. Platform-only external-storage calls are redirected for the same
++/// reason even though the Windows build does not normally use them.
++class PortablePathProviderPlatform extends PathProviderPlatform {
++  PortablePathProviderPlatform({
++    required String dataRoot,
++  }) : _dataRoot = p.normalize(dataRoot);
++
++  final String _dataRoot;
++
++  String get _cachePath => p.join(_dataRoot, 'cache');
++  String get _temporaryPath => p.join(_dataRoot, 'temp');
++  String get _downloadsPath => p.join(_dataRoot, 'exports');
++
++  @override
++  Future<String?> getApplicationSupportPath() async => _dataRoot;
++
++  @override
++  Future<String?> getApplicationDocumentsPath() async => _dataRoot;
++
++  @override
++  Future<String?> getLibraryPath() async => _dataRoot;
++
++  @override
++  Future<String?> getApplicationCachePath() async => _cachePath;
++
++  @override
++  Future<String?> getTemporaryPath() async => _temporaryPath;
++
++  @override
++  Future<String?> getDownloadsPath() async => _downloadsPath;
++
++  @override
++  Future<String?> getExternalStoragePath() async => _dataRoot;
++
++  @override
++  Future<List<String>?> getExternalCachePaths() async => [_cachePath];
++
++  @override
++  Future<List<String>?> getExternalStoragePaths({
++    StorageDirectory? type,
++  }) async => [_dataRoot];
++
++}
+diff --git a/pubspec.lock b/pubspec.lock
+index 60186e44b..6603ab506 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -2139,7 +2139,7 @@ packages:
+     source: hosted
+     version: "2.2.2"
+   path_provider_platform_interface:
+-    dependency: "direct dev"
++    dependency: "direct main"
+     description:
+       name: path_provider_platform_interface
+       sha256: "484838772624c3a4b94f1e44a3e19897fee738f2d5c4ce448443b0417f7c9dda"
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 94be0216d..2b9b119ed 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -109,6 +109,7 @@ dependencies:
+   package_info_plus: ^9.0.0
+   path: ^1.8.1
+   path_provider: ^2.0.12
++  path_provider_platform_interface: any
+   # permission_handler 13.x hard-codes Android compileSdk 37 in its plugin
+   # module; android/build.gradle pins 36 (targetSdk follows it).
+   permission_handler: ^12.0.0+1
+@@ -221,7 +222,6 @@ dev_dependencies:
+   mocktail: ^1.0.0
+   msix: ^3.7.0
+   objectbox_generator: ^5.2.0
+-  path_provider_platform_interface: any
+   permission_handler_platform_interface: any
+   plugin_platform_interface: any
+   share_plus_platform_interface: any
+diff --git a/test/features/profiles/model/profile_context_test.dart b/test/features/profiles/model/profile_context_test.dart
+index ab4c58cfd..90ed796a9 100644
+--- a/test/features/profiles/model/profile_context_test.dart
++++ b/test/features/profiles/model/profile_context_test.dart
+@@ -14,6 +14,18 @@ void main() {
+   );
+ 
+   group('ProfileContext.forProfile', () {
++    test('portable real profile excludes sync and device probes', () {
++      final context = ProfileContext.forProfile(
++        profile: profileOfType(ProfileType.real),
++        root: Directory('portable-root'),
++        portableMode: true,
++      );
++
++      expect(context.capabilities.syncEnabled, isFalse);
++      expect(context.capabilities.healthImportEnabled, isFalse);
++      expect(context.isGuest, isFalse);
++    });
++
+     test('real profiles get full capabilities', () {
+       final context = ProfileContext.forProfile(
+         profile: profileOfType(ProfileType.real),
+diff --git a/test/utils/portable_mode_test.dart b/test/utils/portable_mode_test.dart
+new file mode 100644
+index 000000000..4d89523b2
+--- /dev/null
++++ b/test/utils/portable_mode_test.dart
+@@ -0,0 +1,33 @@
++import 'package:flutter_test/flutter_test.dart';
++import 'package:path/path.dart' as p;
++import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
++import 'package:lotti/utils/portable_mode.dart';
++
++void main() {
++  test('portable path provider keeps every storage class under userdata', () async {
++    final provider = PortablePathProviderPlatform(
++      dataRoot: r'D:\Lotti\userdata',
++    );
++
++    final paths = <String?>[
++      await provider.getApplicationSupportPath(),
++      await provider.getApplicationDocumentsPath(),
++      await provider.getLibraryPath(),
++      await provider.getApplicationCachePath(),
++      await provider.getTemporaryPath(),
++      await provider.getDownloadsPath(),
++      await provider.getExternalStoragePath(),
++      ...?await provider.getExternalCachePaths(),
++      ...?await provider.getExternalStoragePaths(),
++    ];
++
++    for (final path in paths) {
++      expect(
++        p.isWithin(r'D:\Lotti\userdata', path!) ||
++            p.equals(r'D:\Lotti\userdata', path),
++        isTrue,
++        reason: path,
++      );
++    }
++  });
++}
+diff --git a/windows/runner/win32_window.cpp b/windows/runner/win32_window.cpp
+index 60608d0fe..1a9d9d3d8 100644
+--- a/windows/runner/win32_window.cpp
++++ b/windows/runner/win32_window.cpp
+@@ -18,14 +18,6 @@ namespace {
+ 
+ constexpr const wchar_t kWindowClassName[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
+ 
+-/// Registry key for app theme preference.
+-///
+-/// A value of 0 indicates apps should use dark mode. A non-zero or missing
+-/// value indicates apps should use light mode.
+-constexpr const wchar_t kGetPreferredBrightnessRegKey[] =
+-  L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+-constexpr const wchar_t kGetPreferredBrightnessRegValue[] = L"AppsUseLightTheme";
+-
+ // The number of Win32Window objects that currently exist.
+ static int g_active_window_count = 0;
+ 
+@@ -273,16 +265,9 @@ void Win32Window::OnDestroy() {
+ }
+ 
+ void Win32Window::UpdateTheme(HWND const window) {
+-  DWORD light_mode;
+-  DWORD light_mode_size = sizeof(light_mode);
+-  LSTATUS result = RegGetValue(HKEY_CURRENT_USER, kGetPreferredBrightnessRegKey,
+-                               kGetPreferredBrightnessRegValue,
+-                               RRF_RT_REG_DWORD, nullptr, &light_mode,
+-                               &light_mode_size);
+-
+-  if (result == ERROR_SUCCESS) {
+-    BOOL enable_dark_mode = light_mode == 0;
+-    DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
+-                          &enable_dark_mode, sizeof(enable_dark_mode));
+-  }
++  // The personal portable build must not inspect Windows Registry theme
++  // preferences. Keep the title bar in the platform's ordinary light mode.
++  BOOL enable_dark_mode = FALSE;
++  DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
++                        &enable_dark_mode, sizeof(enable_dark_mode));
+ }
+-- 
+2.53.0.windows.3
+
