@@ -11,8 +11,8 @@ env:
   LOTTI_COMMIT: 68afde71fe43f546733437264cbc07511915ea4f
   FLUTTER_VERSION: 3.47.2
   PORTABLE_PATCH: .github/portable-patches/0001-feat-add-marker-based-Windows-portable-mode.patch
-  # SHA-256 of the CRLF checkout produced by Git on windows-latest.
-  PORTABLE_PATCH_SHA256: 1e00b0a5c0714108ec9fe6451c962158bc6921115d972a5fa0555b2e0ee15a35
+  # SHA-256 of the canonical LF patch stored in Git.
+  PORTABLE_PATCH_SHA256: eb9dc4140d9ea2629f482af354a5cd7a6635a183bd5f8934219f6c380b954da7
   PACKAGE_NAME: Lotti-Windows-x64-1.1.12+4390-true-portable-local-only
 
 jobs:
@@ -71,8 +71,11 @@ jobs:
       - name: Verify and apply the portable local-only patch
         shell: pwsh
         run: |
-          $patch = Join-Path "$env:GITHUB_WORKSPACE\workflow-config" $env:PORTABLE_PATCH
-          if (-not (Test-Path $patch)) { throw "Portable patch not found: $patch" }
+          $patchSource = Join-Path "$env:GITHUB_WORKSPACE\workflow-config" $env:PORTABLE_PATCH
+          if (-not (Test-Path $patchSource)) { throw "Portable patch not found: $patchSource" }
+          $patch = Join-Path $env:RUNNER_TEMP 'portable-local-only.patch'
+          $patchText = [IO.File]::ReadAllText($patchSource).Replace("`r`n", "`n")
+          [IO.File]::WriteAllText($patch, $patchText, [Text.UTF8Encoding]::new($false))
           $patchHash = (Get-FileHash $patch -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($patchHash -ne $env:PORTABLE_PATCH_SHA256) {
             throw "Portable patch hash $patchHash does not match $env:PORTABLE_PATCH_SHA256"
@@ -80,6 +83,8 @@ jobs:
           git -C lotti apply --check $patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git -C lotti apply $patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C lotti add -N -- lib/utils/portable_mode.dart test/utils/portable_mode_test.dart
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $expected = @(
